@@ -12,6 +12,7 @@ import httpx
 import asyncpg
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.responses import JSONResponse
+from pyrogram.raw.functions.account import GetAuthorizations, ResetAuthorization
 from pydantic import BaseModel, Field, validator
 from pyrogram import Client
 from pyrogram.errors import (
@@ -218,7 +219,7 @@ async def identify_devices(client: Client) -> Tuple[Optional[str], List[str], in
     Returns: (our_device_hash, other_device_hashes, total_devices)
     """
     try:
-        authorizations = await client.get_authorizations()
+        authorizations = await client.invoke(GetAuthorizations())
         total_devices = len(authorizations)
         our_device_hash = None
         other_devices = []
@@ -260,7 +261,7 @@ async def terminate_other_devices(
     
     for device_hash in other_devices:
         try:
-            await client.reset_authorization(hash=device_hash)
+            await client.invoke(ResetAuthorization(hash=device_hash))
             terminated += 1
             logger.info(f"Terminated device with hash: {device_hash[:10]}...")
             await asyncio.sleep(1)  # Small delay between terminations
