@@ -883,9 +883,10 @@ async def process_device_check(request: ProcessRequest):
 # API endpoints
 @app.post("/process")
 async def process_endpoint(request: ProcessRequest, x_internal_key: str = Depends(verify_internal_key)):
-    async with task_semaphore:
-        result = await process_device_check(request)
-        return JSONResponse(content=result, status_code=200)
+    try:
+        async with task_semaphore:
+            result = await process_device_check(request)
+            return JSONResponse(content=result, status_code=200)
     except HTTPException as e:
         raise e
     except Exception as e:
