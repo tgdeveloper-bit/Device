@@ -41,7 +41,8 @@ INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
 MAIN_SERVER_CALLBACK_URL = os.getenv("MAIN_SERVER_CALLBACK_URL", "")
 MAIN_SERVER_RETRY_URL = os.getenv("MAIN_SERVER_RETRY_URL", "")
 DEVICE_DB_URL = os.getenv("DEVICE_DB_URL", "")
-OUR_DEVICE_MODEL = os.getenv("OUR_DEVICE_MODEL", "CPython 3.12.0")
+# Don't set OUR_DEVICE_MODEL statically - we'll identify it dynamically
+OUR_DEVICE_MODEL = os.getenv("OUR_DEVICE_MODEL", "")
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -197,34 +198,26 @@ async def send_callback(
         logger.error(f"Callback error: {e}")
         return False
 
-# Handle FloodWait with retry
-async def handle_flood_wait(client: Client, error: FloodWait, max_retries: int = 3):
-    """Handle FloodWait errors with exponential backoff"""
-    for attempt in range(max_retries):
-        wait_time = error.value + (attempt * 10)  # Add extra time for each retry
-        logger.warning(f"FloodWait: waiting {wait_time} seconds (attempt {attempt + 1}/{max_retries})")
-        await asyncio.sleep(wait_time)
-        try:
-            # Retry the operation after waiting
-            return True
-        except FloodWait as e:
-            error = e
-            continue
-    return False
-
 # Identify our device and others
-async def identify_devices(client: Client) -> Tuple[Optional[str], List[str], int]:
+async def identify_devices(client: Client) -> Tuple[Optional[int], List[int], int, str]:
     """
     Identify our device and other devices
-    Returns: (our_device_hash, other_device_hashes, total_devices)
+    Returns: (our_device_hash, other_device_hashes, total_devices, our_device_model)
     """
     try:
         result = await client.invoke(GetAuthorizations())
-        authorizations = result.authorizations  # ✅ Access the list
+        authorizations = result.authorizations
+        
         total_devices = len(authorizations)
         our_device_hash = None
+        our_device_model = ""
         other_devices = []
-    
+        
+        # Get our current device info from client
+        me = await client.get_me()
+        logger.info(f"Current session device info: {client.device_model}")
+        our_device_model = client.device_model if hasattr(client, 'device_model') else ""
+        
         for auth in authorizations:
             try:
                 device_model = getattr(auth, 'device_model', 'Unknown')
@@ -233,17 +226,33 @@ async def identify_devices(client: Client) -> Tuple[Optional[str], List[str], in
                 if device_hash is None:
                     continue
                 
-                if device_model == OUR_DEVICE_MODEL:
+                # Check if this is our current device
+                # We can identify our device by checking if it's the most recent one
+                # or by matching the device model with our client's model
+                is_our_device = False
+                
+                # Check if this is the current session's device
+                if hasattr(auth, 'current') and auth.current:
+                    is_our_device = True
+                
+                # Alternative: check if this is the newest authorization
+                if not is_our_device and hasattr(auth, 'date_created'):
+                    # The most recent authorization is likely our current session
+                    if auth.date_created == max(a.date_created for a in authorizations if hasattr(a, 'date_created')):
+                        is_our_device = True
+                
+                if is_our_device or device_model == our_device_model:
                     our_device_hash = device_hash
-                    logger.info(f"Our device found: {device_model}")
+                    logger.info(f"Our device identified: {device_model}")
                 else:
                     other_devices.append(device_hash)
                     logger.info(f"Other device found: {device_model}")
+                    
             except Exception as e:
                 logger.warning(f"Error processing authorization: {e}")
                 continue
         
-        return our_device_hash, other_devices, total_devices
+        return our_device_hash, other_devices, total_devices, our_device_model
     except Exception as e:
         logger.error(f"Failed to get authorizations: {e}")
         raise
@@ -251,39 +260,51 @@ async def identify_devices(client: Client) -> Tuple[Optional[str], List[str], in
 # Terminate other devices
 async def terminate_other_devices(
     client: Client, 
-    other_devices: List[str]
-) -> Tuple[int, bool]:
+    other_devices: List[int]
+) -> Tuple[int, bool, bool]:
     """
     Terminate other devices
-    Returns: (terminated_count, wait_required)
+    Returns: (terminated_count, wait_required, fresh_reset_forbidden)
     """
     terminated = 0
     wait_required = False
+    fresh_reset_forbidden = False
     
     for device_hash in other_devices:
         try:
+            # Convert hash to proper format (long integer)
+            if isinstance(device_hash, str):
+                device_hash = int(device_hash)
+            
             await client.invoke(ResetAuthorization(hash=device_hash))
             terminated += 1
-            logger.info(f"Terminated device with hash: {device_hash[:10]}...")
+            logger.info(f"Terminated device with hash: {str(device_hash)[:10]}...")
             await asyncio.sleep(1)  # Small delay between terminations
+            
         except FloodWait as e:
-            logger.warning(f"FloodWait error: {e}")
-            wait_handled = await handle_flood_wait(client, e)
-            if not wait_handled:
-                wait_required = True
-                break
+            logger.warning(f"FloodWait error: waiting {e.value} seconds")
+            await asyncio.sleep(e.value)
+            continue
+            
         except Exception as e:
             error_str = str(e)
-            if "FRESH_CHANGE_ADMINS_FORBIDDEN" in error_str.upper() or \
-               "fresh change" in error_str.lower():
-                logger.warning("24h wait required for device termination")
+            error_upper = error_str.upper()
+            
+            if "FRESH_RESET_AUTHORISATION_FORBIDDEN" in error_upper or \
+               "FRESH_CHANGE_ADMINS_FORBIDDEN" in error_upper or \
+               "fresh reset" in error_str.lower():
+                logger.warning("Fresh reset forbidden - need to wait 24h")
+                fresh_reset_forbidden = True
                 wait_required = True
                 break
+            elif "HASH_INVALID" in error_upper:
+                logger.warning(f"Invalid hash for device: {str(device_hash)[:10]}...")
+                continue
             else:
                 logger.error(f"Error terminating device: {e}")
                 continue
     
-    return terminated, wait_required
+    return terminated, wait_required, fresh_reset_forbidden
 
 # Main processing function
 async def process_device_check(request: ProcessRequest):
@@ -306,10 +327,10 @@ async def process_device_check(request: ProcessRequest):
         
         # Connect to Telegram
         await client.start()
-        logger.info("Connected to Telegram successfully")
+        logger.info(f"Connected to Telegram successfully. Device: {client.device_model}")
         
         # Get active authorizations
-        our_device_hash, other_devices, total_devices = await identify_devices(client)
+        our_device_hash, other_devices, total_devices, our_device_model = await identify_devices(client)
         
         # Check if we found our device
         our_device_count = 1 if our_device_hash else 0
@@ -319,16 +340,21 @@ async def process_device_check(request: ProcessRequest):
         wait_required = False
         
         if other_devices:
-            terminated, wait_required = await terminate_other_devices(client, other_devices)
-        
-        # Set termination status
-        if wait_required:
-            termination_status = "waiting_24h"
-            wait_until = datetime.utcnow() + timedelta(hours=24)
-            logger.info("24h wait required for device termination")
+            terminated, wait_required, fresh_reset = await terminate_other_devices(client, other_devices)
+            
+            if fresh_reset:
+                logger.info("Fresh reset restriction detected - waiting 24h required")
+                termination_status = "waiting_24h"
+                wait_until = datetime.utcnow() + timedelta(hours=24)
+            elif wait_required:
+                termination_status = "waiting_24h"
+                wait_until = datetime.utcnow() + timedelta(hours=24)
+            else:
+                termination_status = "all_terminated"
+                logger.info(f"All devices terminated: {terminated} devices")
         else:
-            termination_status = "all_terminated"
-            logger.info(f"All devices terminated: {terminated} devices")
+            termination_status = "no_other_devices"
+            logger.info("No other devices to terminate")
         
         # Calculate processing time
         processing_time = int((time.time() - start_time) * 1000)
@@ -352,16 +378,16 @@ async def process_device_check(request: ProcessRequest):
                 "success": False,
                 "device_termination_status": "waiting_24h",
                 "retry_after_hours": 24,
-                "message": "Fresh device change wait required"
+                "message": "Fresh device change wait required (24h)"
             }
             callback_url = request.retry_callback_url or MAIN_SERVER_RETRY_URL
         else:
             callback_data = {
                 "session_id": request.session_id,
                 "success": True,
-                "device_termination_status": "all_terminated",
+                "device_termination_status": termination_status,
                 "other_devices_terminated": terminated,
-                "message": f"All other devices terminated ({terminated} devices)"
+                "message": f"Device check completed. Terminated {terminated} other devices"
             }
             callback_url = request.callback_url or MAIN_SERVER_CALLBACK_URL
         
