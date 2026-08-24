@@ -219,11 +219,12 @@ async def identify_devices(client: Client) -> Tuple[Optional[str], List[str], in
     Returns: (our_device_hash, other_device_hashes, total_devices)
     """
     try:
-        authorizations = await client.invoke(GetAuthorizations())
+        result = await client.invoke(GetAuthorizations())
+        authorizations = result.authorizations  # ✅ Access the list
         total_devices = len(authorizations)
         our_device_hash = None
         other_devices = []
-        
+    
         for auth in authorizations:
             try:
                 device_model = getattr(auth, 'device_model', 'Unknown')
